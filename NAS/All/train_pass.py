@@ -12,6 +12,7 @@ import numpy as np
 from pandas import read_csv
 from sklearn.model_selection import train_test_split
 from sklearn.utils import class_weight
+from sklearn.metrics import balanced_accuracy_score
 import matplotlib.pyplot as plt
 import subprocess
 import params
@@ -27,17 +28,17 @@ def rad2deg(rad):
     return 180.0 * rad / math.pi
 def get_action(angle_rad):
     degree = rad2deg(angle_rad)
-    if degree < 15 and degree > -15:
+    if degree < 10 and degree > -10:
         return "center"
-    elif degree >= 15:
+    elif degree >= 10:
         return "right" 
-    elif degree <-15:
+    elif degree <-10:
         return "left"
 
 def preprocess(img, resize_vals, input_channels):
-    img = cv2.resize(img, (320, 240))
-    img = cv2.flip(img, 1)
-    img = img[0:210, 60:190]
+    #img = cv2.resize(img, (320, 240))
+    #img = cv2.flip(img, 1)
+    #img = img[0:210, 60:190]
     # Convert to grayscale and readd channel dimension
     if input_channels == 1:
         img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
@@ -88,7 +89,7 @@ assert len(imgs) == len(vals)
 stats_file = open("{}/trained_models.csv".format(params.dataset), 'w', newline='')
 writer = csv.writer(stats_file)
 writer.writerow(["Pass", "conv_str", "fc_str", "width_mult", "h_len", "w_len", "d_len",
-    "Weights", "Connections", "Loss", "Val loss", "Accuracy(%)", "SRAM usage(KB)", "Flash size(KB)",
+    "Weights", "Connections", "Loss", "Val loss", "Accuracy(%)", "Balanced Accuracy(%)", "SRAM usage(KB)", "Flash size(KB)",
     "Predicted inf time(ms)", "Inference time(ms)"])
 
 # Open the file that contains the parameters for the models that passed
@@ -109,6 +110,7 @@ for i,row in enumerate(reader):
 
     imgs_temp = np.array([preprocess(img, (int(h_len), int(w_len)), int(d_len)) for img in imgs], dtype=np.float16)
     imgs_train, imgs_test, vals_train, vals_test = train_test_split(imgs_temp, vals, test_size=0.35, random_state=0)
+    print("train: ", len(vals_train), "val: ", len(vals_test))
     class_weights = class_weight.compute_class_weight(class_weight='balanced', classes=np.unique(vals_train), y=vals_train)
     class_weights = {i:class_weights[i] for i in range(len(class_weights))}
 
@@ -120,8 +122,8 @@ for i,row in enumerate(reader):
     for j in range(5):
         model = m.createModel(conv_str, fc_str, float(width_mult), int(h_len), int(w_len), int(d_len))
         q_aware_model = quantize_model(model)
-        q_aware_model.compile(optimizer=tf.keras.optimizers.Adam(1e-4),
-                        loss=tf.keras.losses.MeanSquaredError())
+        q_aware_model.compile(optimizer=tf.keras.optimizers.Adam(3e-3),
+                        loss=tf.keras.losses.Huber())
         history = q_aware_model.fit(imgs_train, vals_train,
                             batch_size=params.batch_size,  epochs=params.epochs, # steps_per_epoch=24,
                             validation_data=(imgs_test, vals_test), class_weight=class_weights)
@@ -167,12 +169,14 @@ for i,row in enumerate(reader):
     predicted = np.array(list(map(get_action, predicted_angles)))
     ground = np.array(list(map(get_action, vals_test)))
     accuracy = np.mean(predicted==ground)*100
+    bal_accuracy = balanced_accuracy_score(ground, predicted)*100
 
     # Print out and write model statistics to csv file
     print("Model", i)
     val_loss = "{:.4f}".format(history.history["val_loss"][-1])
     loss = "{:.4f}".format(history.history["loss"][-1])
     print("Accuracy is {:.2f}%".format(accuracy))
+    print("Balanced Accuracy is {:.2f}%".format(bal_accuracy))
     val = subprocess.Popen(["./find-arena-size", model_file+"model.tflite"], stdout=subprocess.PIPE)
     sram_size = "{:.2f}".format(float(val.communicate()[0].decode("UTF-8")))
     flash_size = "{:.2f}".format((os.path.getsize(model_file+"model.tflite"))/1024.)
@@ -183,7 +187,7 @@ for i,row in enumerate(reader):
     print("Predicted inference time = {} ms".format(predict_inf))
     print("MODEL PASS  {}".format(did_model_pass))
     writer.writerow([did_model_pass, conv_str, fc_str, width_mult, h_len, w_len, d_len,
-        Connections, Weights, loss, val_loss, accuracy, sram_size, flash_size, predict_inf])
+        Connections, Weights, loss, val_loss, accuracy, bal_accuracy, sram_size, flash_size, predict_inf])
 
     # If the model passes the val loss check, create an empty file in the model directory
     #	Used by create-cc.sh to determine which models to add to the .cpp/.h files
