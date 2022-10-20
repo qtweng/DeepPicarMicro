@@ -35,9 +35,9 @@ def get_action(angle_rad):
         return "left"
 
 def preprocess(img, resize_vals, input_channels):
-    img = cv2.resize(img, (320, 240))
-    img = cv2.flip(img, 1)
-    img = img[0:210, 60:190]
+    # img = cv2.resize(img, (320, 240))
+    # img = cv2.flip(img, 1)
+    # img = img[0:210, 60:190]
     # Convert to grayscale and readd channel dimension
     if input_channels == 1:
         img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
@@ -55,6 +55,24 @@ def predict_time(connections):
     b = 22.189388
     inf = (m * connections) + b
     return inf
+
+def print_model_weights_sparsity(model):
+
+    for layer in model.layers:
+        if isinstance(layer, tf.keras.layers.Wrapper):
+            weights = layer.trainable_weights
+        else:
+            weights = layer.weights
+        for weight in weights:
+            # ignore auxiliary quantization weights
+            if "quantize_layer" in weight.name:
+                continue
+            weight_size = weight.numpy().size
+            zero_num = np.count_nonzero(weight == 0)
+            print(
+                f"{weight.name}: {zero_num/weight_size:.2%} sparsity ",
+                f"({zero_num}/{weight_size})",
+            )
 
 # Train/test data lists
 imgs = []
@@ -102,7 +120,7 @@ for i,row in enumerate(reader):
         continue
 
     # Get model parameters for current architecture
-    [conv_str, fc_str, width_mult, h_len, w_len, d_len, Weights, Connections] = row
+    [conv_str, fc_str, width_mult, h_len, w_len, d_len, Connections, Weights] = row
     model_file = "{}/models/{}-{}_{}x{}x{}_{}/".format(params.dataset, conv_str, fc_str, w_len, h_len, d_len, width_mult)
     if not os.path.exists(model_file):
         os.makedirs(model_file)
@@ -113,18 +131,59 @@ for i,row in enumerate(reader):
     class_weights = {i:class_weights[i] for i in range(len(class_weights))}
 
     # Quantize and train the model
-    quantize_model = tfmot.quantization.keras.quantize_model
+    quantize_model = tfmot.quantization.keras.quantize_annotate_model
 
     # Create new train and test datasets for the current architecture
     #	Train multiple models to try and pass the val_loss check
     for j in range(5):
         model = m.createModel(conv_str, fc_str, float(width_mult), int(h_len), int(w_len), int(d_len))
-        q_aware_model = quantize_model(model)
+
+        prune_low_magnitude = tfmot.sparsity.keras.prune_low_magnitude
+
+        # Compute end step to finish pruning after after 5 epochs.
+        end_epoch = 5
+
+        num_iterations_per_epoch = len(imgs_train)
+        end_step =  num_iterations_per_epoch * end_epoch
+
+        # Define parameters for pruning.
+        pruning_params = {
+            'pruning_schedule': tfmot.sparsity.keras.PolynomialDecay(initial_sparsity=0.25,
+                                                                    final_sparsity=0.75,
+                                                                    begin_step=0,
+                                                                    end_step=end_step),
+            'pruning_policy': tfmot.sparsity.keras.PruneForLatencyOnXNNPack()
+        }
+
+        model.summary()
+
+        # Try to apply pruning wrapper with pruning policy parameter.
+        model_for_pruning = prune_low_magnitude(model, **pruning_params)
+        
+        
+        callbacks = [
+            tfmot.sparsity.keras.UpdatePruningStep()
+        ]
+
+        model_for_pruning.compile(optimizer=tf.keras.optimizers.Adam(1e-4),
+                            loss=tf.keras.losses.MeanSquaredError())
+
+        model_for_pruning.fit(imgs_train, vals_train,
+                                batch_size=params.batch_size,  epochs=params.epochs, # steps_per_epoch=24,
+                                validation_data=(imgs_test, vals_test), class_weight=class_weights, callbacks=callbacks)
+
+        stripped_pruned_model = tfmot.sparsity.keras.strip_pruning(model_for_pruning)
+
+        q_aware_model = quantize_model(stripped_pruned_model)
+        q_aware_model = tfmot.quantization.keras.quantize_apply(
+              q_aware_model,
+              tfmot.experimental.combine.Default8BitPrunePreserveQuantizeScheme())
         q_aware_model.compile(optimizer=tf.keras.optimizers.Adam(1e-4),
                         loss=tf.keras.losses.MeanSquaredError())
         history = q_aware_model.fit(imgs_train, vals_train,
                             batch_size=params.batch_size,  epochs=params.epochs, # steps_per_epoch=24,
                             validation_data=(imgs_test, vals_test), class_weight=class_weights)
+        print_model_weights_sparsity(q_aware_model)
 
         # Exit the training loop if the val_loss check is met or val_loss is too high
         if history.history['val_loss'][-1] <= params.val_loss or history.history['val_loss'][-1] > params.val_high or j==4:
@@ -134,6 +193,7 @@ for i,row in enumerate(reader):
         del(q_aware_model)
         del(history)
         gc.collect()
+    q_aware_model.summary()
 
     # Save the model as H5 and TFLite files
     q_aware_model.save(model_file+"model.h5")
